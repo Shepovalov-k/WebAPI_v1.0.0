@@ -1,0 +1,11 @@
+@WebAPI_v1._0._0_HostAddress = http://localhost:32768
+
+GET {{WebAPI_v1._0._0_HostAddress}}/todos/
+Accept: application/json
+
+###
+
+GET {{WebAPI_v1._0._0_HostAddress}}/todos/1
+Accept: application/json
+
+###
