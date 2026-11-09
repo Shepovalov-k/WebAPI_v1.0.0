@@ -28,7 +28,8 @@ services:
     ports:
       - "5000:8080"
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

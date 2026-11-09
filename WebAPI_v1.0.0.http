@@ -1,11 +1,24 @@
-@WebAPI_v1._0._0_HostAddress = http://localhost:32768
+@HostAddress = http://localhost:5000
 
-GET {{WebAPI_v1._0._0_HostAddress}}/todos/
+### Upload a CSV (Date;ExecutionTime;Value)
+POST {{HostAddress}}/api/data/upload
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="file"; filename="sample.csv"
+Content-Type: text/csv
+
+Date;ExecutionTime;Value
+2024-01-01T10:00:00Z;1.5;10
+2024-01-01T10:00:05Z;2.0;20
+--boundary--
+
+### Filtered, paginated results
+GET {{HostAddress}}/api/data/results?pageNumber=1&pageSize=20
 Accept: application/json
 
-###
-
-GET {{WebAPI_v1._0._0_HostAddress}}/todos/1
+### Last 10 values for a file
+GET {{HostAddress}}/api/data/values/last?fileName=sample.csv
 Accept: application/json
 
 ###

@@ -8,6 +8,8 @@ namespace TimescaleApi.Services;
 
 public class CsvProcessingService : ICsvProcessingService
 {
+    private const int MaxDataRows = 10_000;
+
     private readonly AppDbContext _dbContext;
     private static readonly DateTimeOffset MinAllowedDate = new(2000, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
@@ -20,114 +22,107 @@ public class CsvProcessingService : ICsvProcessingService
     {
         // Чтение и валидация до начала транзакции
         var parsedValues = await ParseAndValidateFileAsync(file, cancellationToken);
-
         var fileName = file.FileName;
-        var fileRecord = await _dbContext.Files
-            .FirstOrDefaultAsync(f => f.FileName == fileName, cancellationToken);
 
+        // Если что-то упадёт до CommitAsync, транзакция откатится при Dispose.
         await using var transaction = await _dbContext.Database.BeginTransactionAsync(cancellationToken);
 
-        try
+        // Атомарно создаём запись о файле (если её нет) и блокируем строку,
+        // чтобы параллельные загрузки одного и того же файла выполнялись по очереди.
+        await _dbContext.Database.ExecuteSqlInterpolatedAsync(
+            $@"INSERT INTO ""Files"" (""FileName"") VALUES ({fileName}) ON CONFLICT (""FileName"") DO NOTHING",
+            cancellationToken);
+
+        var fileIds = await _dbContext.Database
+            .SqlQuery<int>($@"SELECT ""Id"" AS ""Value"" FROM ""Files"" WHERE ""FileName"" = {fileName} FOR UPDATE")
+            .ToListAsync(cancellationToken);
+        var fileId = fileIds.Single();
+
+        // Удаляем старые данные одним запросом, без загрузки сущностей в память
+        await _dbContext.Values.Where(v => v.FileId == fileId).ExecuteDeleteAsync(cancellationToken);
+        await _dbContext.Results.Where(r => r.FileId == fileId).ExecuteDeleteAsync(cancellationToken);
+
+        foreach (var value in parsedValues)
         {
-            if (fileRecord == null)
-            {
-                fileRecord = new FileRecord { FileName = fileName };
-                _dbContext.Files.Add(fileRecord);
-                await _dbContext.SaveChangesAsync(cancellationToken);
-            }
-            else
-            {
-                var oldValues = _dbContext.Values.Where(v => v.FileId == fileRecord.Id);
-                _dbContext.Values.RemoveRange(oldValues);
+            value.FileId = fileId;
+        }
+        _dbContext.Values.AddRange(parsedValues);
 
-                var oldResult = await _dbContext.Results
-                    .FirstOrDefaultAsync(r => r.FileId == fileRecord.Id, cancellationToken);
-                if (oldResult != null)
-                    _dbContext.Results.Remove(oldResult);
+        var result = ComputeResult(parsedValues);
+        result.FileId = fileId;
+        _dbContext.Results.Add(result);
 
-                await _dbContext.SaveChangesAsync(cancellationToken);
-            }
+        await _dbContext.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
 
-            foreach (var value in parsedValues)
-            {
-                value.FileId = fileRecord.Id;
-            }
-            await _dbContext.Values.AddRangeAsync(parsedValues, cancellationToken);
-            await _dbContext.SaveChangesAsync(cancellationToken);
-
-            var result = ComputeResult(parsedValues);
-            result.FileId = fileRecord.Id;
-            await _dbContext.Results.AddAsync(result, cancellationToken);
-            await _dbContext.SaveChangesAsync(cancellationToken);
-
-            await transaction.CommitAsync(cancellationToken);
-
-            return new CsvUploadResult
+        return new CsvUploadResult
+        {
+            FileName = fileName,
+            RowsProcessed = parsedValues.Count,
+            Result = new ResultDto
             {
                 FileName = fileName,
-                RowsProcessed = parsedValues.Count,
-                Result = new ResultDto
-                {
-                    FileName = fileName,
-                    DeltaTimeSeconds = result.DeltaTimeSeconds,
-                    MinDate = result.MinDate,
-                    AvgExecutionTime = result.AvgExecutionTime,
-                    AvgValue = result.AvgValue,
-                    MedianValue = result.MedianValue,
-                    MaxValue = result.MaxValue,
-                    MinValue = result.MinValue
-                }
-            };
-        }
-        catch
-        {
-            await transaction.RollbackAsync(cancellationToken);
-            throw;
-        }
+                DeltaTimeSeconds = result.DeltaTimeSeconds,
+                MinDate = result.MinDate,
+                AvgExecutionTime = result.AvgExecutionTime,
+                AvgValue = result.AvgValue,
+                MedianValue = result.MedianValue,
+                MaxValue = result.MaxValue,
+                MinValue = result.MinValue
+            }
+        };
     }
 
-    private async Task<List<ValueRecord>> ParseAndValidateFileAsync(IFormFile file, CancellationToken cancellationToken)
+    private static async Task<List<ValueRecord>> ParseAndValidateFileAsync(IFormFile file, CancellationToken cancellationToken)
     {
         if (file == null || file.Length == 0)
             throw new InvalidDataException("Файл пустой.");
 
-        var lines = new List<string>();
+        // (номер строки в файле, текст). Пустые строки пропускаются.
+        var lines = new List<(int Number, string Text)>();
+        var headerChecked = false;
+        var hasHeader = false;
+        var lineNumber = 0;
+
         using (var reader = new StreamReader(file.OpenReadStream()))
         {
-            while (!reader.EndOfStream)
+            string? line;
+            while ((line = await reader.ReadLineAsync(cancellationToken)) != null)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                lines.Add(await reader.ReadLineAsync() ?? string.Empty);
+                lineNumber++;
+                if (string.IsNullOrWhiteSpace(line))
+                    continue;
+
+                if (!headerChecked)
+                {
+                    headerChecked = true;
+                    if (IsHeader(line))
+                    {
+                        hasHeader = true;
+                        continue;
+                    }
+                }
+
+                lines.Add((lineNumber, line));
+                if (lines.Count > MaxDataRows)
+                    throw new InvalidDataException("Количество строк не может быть больше 10 000.");
             }
         }
 
-        if (lines.Count == 0)
-            throw new InvalidDataException("Файл не содержит строк.");
-
-        var header = lines[0].Split(';');
-        bool hasHeader = header.Length == 3
-                         && header[0].Trim().Equals("Date", StringComparison.OrdinalIgnoreCase)
-                         && header[1].Trim().Equals("ExecutionTime", StringComparison.OrdinalIgnoreCase)
-                         && header[2].Trim().Equals("Value", StringComparison.OrdinalIgnoreCase);
-
-        if (hasHeader)
-            lines.RemoveAt(0);
-
         if (lines.Count < 1)
-            throw new InvalidDataException("Количество строк не может быть меньше 1.");
-        if (lines.Count > 10_000)
-            throw new InvalidDataException("Количество строк не может быть больше 10 000.");
+            throw new InvalidDataException(hasHeader
+                ? "Количество строк не может быть меньше 1."
+                : "Файл не содержит строк.");
 
         var values = new List<ValueRecord>(lines.Count);
         var errors = new List<string>();
 
-        for (int i = 0; i < lines.Count; i++)
+        foreach (var (number, text) in lines)
         {
-            var lineNumber = hasHeader ? i + 2 : i + 1;
-            var parts = lines[i].Split(';');
+            var parts = text.Split(';');
             if (parts.Length != 3)
             {
-                errors.Add($"Строка {lineNumber}: ожидается 3 колонки, получено {parts.Length}.");
+                errors.Add($"Строка {number}: ожидается 3 колонки, получено {parts.Length}.");
                 continue;
             }
 
@@ -137,47 +132,51 @@ public class CsvProcessingService : ICsvProcessingService
 
             if (string.IsNullOrEmpty(dateStr) || string.IsNullOrEmpty(execTimeStr) || string.IsNullOrEmpty(valueStr))
             {
-                errors.Add($"Строка {lineNumber}: одно из значений отсутствует.");
+                errors.Add($"Строка {number}: одно из значений отсутствует.");
                 continue;
             }
 
-            if (!DateTimeOffset.TryParse(dateStr, CultureInfo.InvariantCulture, DateTimeStyles.None, out var date))
+            // Дата без смещения трактуется как UTC, а не как локальное время сервера
+            if (!DateTimeOffset.TryParse(dateStr, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var date))
             {
-                errors.Add($"Строка {lineNumber}: неверный формат даты.");
+                errors.Add($"Строка {number}: неверный формат даты.");
                 continue;
             }
-            date = date.ToUniversalTime();
 
             if (date < MinAllowedDate)
             {
-                errors.Add($"Строка {lineNumber}: дата не может быть раньше 01.01.2000.");
+                errors.Add($"Строка {number}: дата не может быть раньше 01.01.2000.");
                 continue;
             }
             if (date > DateTimeOffset.UtcNow)
             {
-                errors.Add($"Строка {lineNumber}: дата не может быть позже текущей.");
+                errors.Add($"Строка {number}: дата не может быть позже текущей.");
                 continue;
             }
 
-            if (!double.TryParse(execTimeStr, NumberStyles.Float, CultureInfo.InvariantCulture, out var execTime))
+            // double.IsFinite отсекает NaN и ±Infinity, которые double.TryParse принимает
+            if (!double.TryParse(execTimeStr, NumberStyles.Float, CultureInfo.InvariantCulture, out var execTime)
+                || !double.IsFinite(execTime))
             {
-                errors.Add($"Строка {lineNumber}: неверный формат времени выполнения.");
+                errors.Add($"Строка {number}: неверный формат времени выполнения.");
                 continue;
             }
             if (execTime < 0)
             {
-                errors.Add($"Строка {lineNumber}: время выполнения не может быть меньше 0.");
+                errors.Add($"Строка {number}: время выполнения не может быть меньше 0.");
                 continue;
             }
 
-            if (!double.TryParse(valueStr, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+            if (!double.TryParse(valueStr, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
+                || !double.IsFinite(value))
             {
-                errors.Add($"Строка {lineNumber}: неверный формат значения показателя.");
+                errors.Add($"Строка {number}: неверный формат значения показателя.");
                 continue;
             }
             if (value < 0)
             {
-                errors.Add($"Строка {lineNumber}: значение показателя не может быть меньше 0.");
+                errors.Add($"Строка {number}: значение показателя не может быть меньше 0.");
                 continue;
             }
 
@@ -197,7 +196,16 @@ public class CsvProcessingService : ICsvProcessingService
         return values;
     }
 
-    private ResultRecord ComputeResult(List<ValueRecord> values)
+    private static bool IsHeader(string line)
+    {
+        var header = line.Split(';');
+        return header.Length == 3
+               && header[0].Trim().Equals("Date", StringComparison.OrdinalIgnoreCase)
+               && header[1].Trim().Equals("ExecutionTime", StringComparison.OrdinalIgnoreCase)
+               && header[2].Trim().Equals("Value", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static ResultRecord ComputeResult(List<ValueRecord> values)
     {
         var minDate = values.Min(v => v.Date);
         var maxDate = values.Max(v => v.Date);
